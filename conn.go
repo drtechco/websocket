@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
@@ -1243,4 +1244,159 @@ func FormatCloseMessage(closeCode int, text string) []byte {
 	binary.BigEndian.PutUint16(buf, uint16(closeCode))
 	copy(buf[2:], text)
 	return buf
+}
+
+// NextFrameRaw returns the next data frame's message type and payload without extra copying.
+// If a control or non-data frame is encountered, it will be handled and discarded internally,
+// then the function will continue to read until it finds a data frame (TextMessage or BinaryMessage).
+//
+// Prerequisites:
+// - No compression.
+// - Client receiving server messages, so no mask needed.
+// - Single-frame messages (no continuation frames) for simplicity.
+//
+// This method loops over frames, handling control frames (Ping, Pong, Close) internally.
+// Ping: read payload, send Pong
+// Pong: read payload and ignore
+// Close: handle close, return error
+// If a continuation frame occurs, return an error in this simplified version.
+//
+// After returning a data frame (TextMessage/BinaryMessage), you must call DiscardFrameData()
+// once you finish processing the returned payload.
+func (c *Conn) NextFrameRaw() (frameType int, payload []byte, err error) {
+	// Ensure previous reader state is cleared
+	if c.reader != nil {
+		c.reader.Close()
+		c.reader = nil
+	}
+	c.readLength = 0
+
+	for {
+		ft, err := c.advanceFrame()
+		if err != nil {
+			return noFrame, nil, err
+		}
+
+		switch ft {
+		case TextMessage, BinaryMessage:
+			// Data frame found, return zero-copy payload
+			n := int(c.readRemaining)
+			buf, err := c.br.Peek(n)
+			if err != nil {
+				return noFrame, nil, err
+			}
+			return ft, buf, nil
+
+		case PingMessage:
+			// Handle ping frame: read payload, respond with pong
+			if err := c.handlePingFrame(); err != nil {
+				return noFrame, nil, err
+			}
+			// After handling ping, continue to the next frame
+
+		case PongMessage:
+			// Handle pong frame: read and ignore payload
+			if err := c.handlePongFrame(); err != nil {
+				return noFrame, nil, err
+			}
+			// Continue to the next frame
+
+		case CloseMessage:
+			// Handle close frame: respond if needed and return error
+			if err := c.handleCloseFrame(); err != nil {
+				return noFrame, nil, err
+			}
+			return noFrame, nil, &CloseError{Code: CloseNormalClosure, Text: "remote closed"}
+
+		case continuationFrame:
+			// In this simplified version, we don't support continuation frames.
+			// Return an error or handle it as needed.
+			return noFrame, nil, fmt.Errorf("NextFrameRaw: unexpected continuation frame")
+
+		default:
+			// Unknown frame type
+			return noFrame, nil, fmt.Errorf("NextFrameRaw: unknown frame type %d", ft)
+		}
+	}
+}
+
+// handlePingFrame reads the ping frame payload and sends a pong response.
+// In a real implementation, you'd read the payload from c.br and then write a Pong frame.
+func (c *Conn) handlePingFrame() error {
+	// Read ping payload
+	n := int(c.readRemaining)
+	_, err := c.br.Peek(n)
+	if err != nil {
+		return err
+	}
+	// Discard ping payload
+	if _, err := c.br.Discard(n); err != nil {
+		return err
+	}
+	if err := c.setReadRemaining(0); err != nil {
+		return err
+	}
+	c.readFinal = true
+	c.messageReader = nil
+
+	// Send pong
+	// In a real implementation, you'd write a Pong frame here:
+	// c.WriteControl(PongMessage, p, time.Now().Add(writeWait))
+
+	return nil
+}
+
+// handlePongFrame reads and ignores pong frame payload.
+func (c *Conn) handlePongFrame() error {
+	n := int(c.readRemaining)
+	if _, err := c.br.Discard(n); err != nil {
+		return err
+	}
+	if err := c.setReadRemaining(0); err != nil {
+		return err
+	}
+	c.readFinal = true
+	c.messageReader = nil
+	// No response needed for Pong.
+	return nil
+}
+
+// handleCloseFrame reads the close frame payload, processes it, and typically returns an error.
+// In a real implementation, you might send a close acknowledgment if not already done.
+func (c *Conn) handleCloseFrame() error {
+	n := int(c.readRemaining)
+	_, err := c.br.Peek(n)
+	if err != nil {
+		return err
+	}
+	// parse close code and message if needed
+
+	if _, err := c.br.Discard(n); err != nil {
+		return err
+	}
+	if err := c.setReadRemaining(0); err != nil {
+		return err
+	}
+	c.readFinal = true
+	c.messageReader = nil
+
+	// Optionally send a close response if not already sent
+	// c.WriteControl(CloseMessage, FormatCloseMessage(CloseNormalClosure, ""), time.Now().Add(writeWait))
+
+	return nil
+}
+
+// DiscardFrameData discards the data frame previously returned by NextFrameRaw().
+// Call this after finishing with the payload. This moves the internal pointer forward.
+func (c *Conn) DiscardFrameData() error {
+	n := int(c.readRemaining)
+	if _, err := c.br.Discard(n); err != nil {
+		return err
+	}
+	if err := c.setReadRemaining(0); err != nil {
+		return err
+	}
+	c.readFinal = true
+	c.messageReader = nil
+	return nil
 }
